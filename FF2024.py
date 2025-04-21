@@ -1,8 +1,9 @@
 import os
 import pandas as pd
 from pathlib import Path
+import numpy as np
 
-#function to read files in a loop
+#function to read files in a loop--------------------------------------------------------------------------------
 def read_files_to_dataframe(folder_path, file_extension='.csv', **kwargs):
 
     # Create a Path object
@@ -53,8 +54,38 @@ def read_files_to_dataframe(folder_path, file_extension='.csv', **kwargs):
         f"Combined {len(dfs)} files into a DataFrame with {combined_df.shape[0]} rows and {combined_df.shape[1]} columns")
 
     return combined_df
+#----------------------------------------------------------------------------------------------------------------------
 
-#read the QB files in
+#QB data cleaning-----------------------------------------------------------------------------------
 qb = read_files_to_dataframe(
     r"C:\Users\musel\OneDrive\Desktop\Sports Stuff\Fantasy football\Weekly QB Results FantasyData", ".xlsx")
+
+# Extract first four characters, convert to integer, and create a new column named 'Year'
+qb['Year'] = qb['source_file'].str[:4].astype(int)
+
+# Drop un-needed columns, check output
+qb = qb.drop(columns=['source_file','RK'])
+print(qb.head())
+print(qb.dtypes)
+
+qb['Rank'] = qb.groupby(['Year', 'WK'])['FPTS'].rank(method='dense', ascending=False)
+
+# Step 1: Create parv_step with selected columns from qb
+parv_step = qb[['Rank', 'Year', 'FPTS']].copy()
+
+# Step 2: Filter for rows where Rank equals 12
+parv_step = parv_step[parv_step['Rank'] == 12]
+
+# Step 3: Group by Year and calculate average FPTS
+avg_by_year = parv_step.groupby('Year')['FPTS'].mean().reset_index()
+avg_by_year.rename(columns={'FPTS': 'Replacement Level Points'}, inplace=True)
+
+# check the result
+print(avg_by_year)
+
+#join in replacement level points to main QB dataframe
+qb = qb.merge(avg_by_year, on='Year', how='inner')
+qb['PARV']= qb['FPTS'] - qb['Replacement Level Points']
+qb['PARV'] = np.where(qb['PARV'] < 0, 0, qb['PARV'])
+
 print(qb.head())
