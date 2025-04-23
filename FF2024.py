@@ -68,6 +68,7 @@ qb = qb.drop(columns=['source_file','RK'])
 print(qb.head())
 print(qb.dtypes)
 
+#start process of calculating PARV (Points Above Replacement Value)
 qb['Rank'] = qb.groupby(['Year', 'WK'])['FPTS'].rank(method='dense', ascending=False)
 
 # Step 1: Create parv_step with selected columns from qb
@@ -89,3 +90,15 @@ qb['PARV']= qb['FPTS'] - qb['Replacement Level Points']
 qb['PARV'] = np.where(qb['PARV'] < 0, 0, qb['PARV'])
 
 print(qb.head())
+print(len(qb)," before Taysom filter")
+
+#Taysom is an outlier, filter out
+qb = qb[qb['NAME'] != 'Taysom Hill']
+print(len(qb))
+
+#clean up name so it is consistent YOY
+qb['NAME'] = np.where(qb['NAME'] =='Mitchell Trubisky','Mitch Trubisky',qb['NAME'])
+
+qb = qb.groupby('NAME','Year')['PARV'].sum()
+print(qb.head(), " after groupby")
+print(len(qb), " after groupby")
