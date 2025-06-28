@@ -352,6 +352,8 @@ def standardize_column_names(df):
         'NAME': 'PLAYER',
         'Player': 'PLAYER',
         'player': 'PLAYER',
+        'Player Name': 'PLAYER',
+        'Full Name': 'PLAYER',
 
         'position': 'POS',
         'Position': 'POS',
@@ -571,6 +573,8 @@ excel_files = [
     ]
 
 final_df = combine_excel_files(excel_files)
+
+
 final_df['PLAYER'] = np.where(final_df['PLAYER'] =='MITCHELLTRUBISKY','MITCHTRUBISKY',final_df['PLAYER'])
 final_df = final_df.rename(columns={'PLAYER': 'join name','year': 'Year','TEAM': 'madden team'})
 spt_staging = final_df.copy()
@@ -700,6 +704,73 @@ spt_staging = calculate_supporting_cast_metrics(spt_staging)
 spt_staging = spt_staging[['join name','Year','madden team', 'Overall Supporting Cast', 'Offensive Supporting Cast', 'Oline Support']]
 pd.set_option('display.max_rows',None)
 pd.set_option('display.max_columns',None)
-print("check spt_staging final results")
-print(spt_staging.head())
+#print("check spt_staging final results")
+#print(spt_staging.head())
+qbdata = pd.merge(qbdata, spt_staging, on=['join name','Year'],how='left')
+qbdata = qbdata.drop(columns=['POS','madden team_x','madden team_y'])
+print("check qbdata after spt merge, column drops")
+qbdata.info()
 
+s_grab = qbdata.groupby(['Year', 'TEAM'])[
+    ['Overall Supporting Cast', 'Offensive Supporting Cast', 'Oline Support']
+].max().reset_index()
+#print("check s_grab\n",
+ #     s_grab)
+print(f"\nOriginal qbdata length: {len(qbdata)}")
+qbdata = qbdata.merge(
+    s_grab,
+    on=['Year', 'TEAM'],
+    how='inner',
+    suffixes=('_original', '_max')
+)
+# Check merged data length
+print(f"Merged data length: {len(qbdata)}")
+
+# Combine original and max columns - use max values to fill null values in original columns
+qbdata['Overall Supporting Cast'] = qbdata['Overall Supporting Cast_original'].fillna(
+    qbdata['Overall Supporting Cast_max']
+)
+
+qbdata['Offensive Supporting Cast'] = qbdata['Offensive Supporting Cast_original'].fillna(
+    qbdata['Offensive Supporting Cast_max']
+)
+
+qbdata['Oline Support'] = qbdata['Oline Support_original'].fillna(
+    qbdata['Oline Support_max']
+)
+
+# Drop the temporary columns with suffixes
+qbdata = qbdata.drop(columns=[
+    'Overall Supporting Cast_original', 'Overall Supporting Cast_max',
+    'Offensive Supporting Cast_original', 'Offensive Supporting Cast_max',
+    'Oline Support_original', 'Oline Support_max','join name'
+])
+print("check qbdata after the supporting cast merger")
+qbdata.info()
+
+
+def fill_missing_madden_values(df):
+    # Create a copy to avoid modifying the original dataframe
+    df_filled = df.copy()
+
+    # Ensure the dataframe is sorted by NAME and Year for proper forward fill
+    df_filled = df_filled.sort_values(['NAME', 'Year'])
+
+    # Columns to fill
+    columns_to_fill = ['Overall', 'Speed', 'Awareness']
+
+    # Group by NAME and forward fill the specified columns
+    # This will use the previous year's value to fill missing values
+    for col in columns_to_fill:
+        if col in df_filled.columns:
+            df_filled[col] = df_filled.groupby('NAME')[col].ffill()
+        else:
+            print(f"Warning: Column '{col}' not found in dataframe")
+
+    return df_filled
+
+qbdata = fill_missing_madden_values(qbdata)
+#qbdata.to_excel(r'C:\Users\musel\OneDrive\Desktop\qb check.xlsx')
+
+qbdata = qbdata.dropna(subset=['ADP', 'Overall'], how='all')
+print(f"length after ADP & Overall filter: {len(qbdata)}")
