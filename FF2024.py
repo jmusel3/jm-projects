@@ -5,6 +5,12 @@ import numpy as np
 from scipy.optimize import minimize
 from statsmodels.tsa.holtwinters import ExponentialSmoothing, SimpleExpSmoothing
 import re
+import matplotlib.pyplot as plt
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import PowerTransformer
+from typing import List, Union, Optional
+from pandas.plotting import scatter_matrix
+from sklearn.preprocessing import QuantileTransformer
 
 #function to read files in a loop--------------------------------------------------------------------------------
 def read_files_to_dataframe(folder_path, file_extension='.csv', **kwargs):
@@ -774,3 +780,45 @@ qbdata = fill_missing_madden_values(qbdata)
 
 qbdata = qbdata.dropna(subset=['ADP', 'Overall'], how='all')
 print(f"length after ADP & Overall filter: {len(qbdata)}")
+
+#TRAIN TEST SPLIT----------------------------------------------------------------------------------------------------
+qbdata['PARVPG_bins'] = pd.qcut(qbdata['PARVPG'], q=5, labels=False,duplicates='drop')
+X = qbdata.drop(columns=['PARVPG'])  #features
+y = qbdata['PARVPG']  #target
+
+X_train, X_test, y_train, y_test = train_test_split(
+    X, y, test_size=0.2, random_state=42,
+    stratify=qbdata['PARVPG_bins']
+)
+#Transform needed variables--------------------------------------------------------------------------------------
+transformer = PowerTransformer(method='yeo-johnson', standardize=False)
+columns_to_transform = ['SmoothedPARVPG', 'Pick']
+# Fit ONLY on training data
+X_train_transformed = X_train.copy()
+X_train_transformed[columns_to_transform] = transformer.fit_transform(X_train[columns_to_transform])
+
+# Apply the same transformation to test data (using parameters learned from training)
+X_test_transformed = X_test.copy()
+X_test_transformed[columns_to_transform] = transformer.transform(X_test[columns_to_transform])
+
+qt = QuantileTransformer(output_distribution='normal', random_state=42)
+X_train_transformed['ADP_transformed'] = qt.fit_transform(X_train[['ADP']])
+X_test_transformed['ADP_transformed'] = qt.transform(X_test[['ADP']])
+
+y_train = transformer.fit_transform(y_train.values.reshape(-1, 1))
+y_test = transformer.fit_transform(y_test.values.reshape(-1, 1))
+
+print('check the distribution of the X data points')
+X_train_transformed.hist(bins=7,figsize=(12,8))
+plt.xticks(rotation=45)
+plt.title("X_train_transformed")
+plt.tight_layout()
+
+print('check the distribution of the Y data points')
+y_train.hist(bins=7,figsize=(12,8)) #need to fix this now
+plt.xticks(rotation=45)
+plt.title("y_train")
+plt.tight_layout()
+
+plt.show()
+
