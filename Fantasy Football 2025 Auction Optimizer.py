@@ -37,157 +37,6 @@ def scrape_fantasy_projections(url):
             print("Could not find the projections table. The page structure may have changed.")
             return None
 
-        # Extract table headers - look for <small> tags which contain the actual column names
-        thead = table.find('thead')
-        if not thead:
-            print("Could not find table header section")
-            return None
-
-        headers = []
-
-        # First, try to find all <small> tags in the thead section
-        small_tags = thead.find_all('small')
-        if small_tags:
-            print("Found <small> tags for headers")
-            for small in small_tags:
-                header_text = small.get_text(strip=True)
-                if header_text:
-                    headers.append(header_text)
-
-        # If no <small> tags found, try the tablesorter-header approach
-        if not headers:
-            print("No <small> tags found, trying tablesorter-header approach")
-            headers_row = thead.find('tr', class_='tablesorter-header')
-
-            if not headers_row:
-                # Fallback: try to find any tr with tablesorter-header elements
-                all_rows = thead.find_all('tr')
-                for row in all_rows:
-                    if row.find('th', class_='tablesorter-header'):
-                        headers_row = row
-                        break
-
-            if headers_row:
-                for th in headers_row.find_all('th'):
-                    # Look for the inner div with the actual header text
-                    inner_div = th.find('div', class_='tablesorter-header-inner')
-                    if inner_div:
-                        header_text = inner_div.get_text(strip=True)
-                    else:
-                        header_text = th.get_text(strip=True)
-
-                    if header_text:
-                        headers.append(header_text)
-
-        # Final fallback: try to extract from any th elements
-        if not headers:
-            print("Trying fallback header extraction from all th elements")
-            all_th = thead.find_all('th')
-            for th in all_th:
-                # First try to find <small> tag within this th
-                small = th.find('small')
-                if small:
-                    header_text = small.get_text(strip=True)
-                elif 'Player' in th.get('class', []) or 'player' in str(th).lower():
-                    header_text = "PLAYER"
-                else:
-                    header_text = th.get_text(strip=True)
-
-                if header_text and header_text not in headers:
-                    headers.append(header_text)
-
-        if not headers:
-            print("Could not extract any headers from the table")
-            return None
-
-        print(f"Found headers: {headers}")
-
-        # Extract table data
-        tbody = table.find('tbody')
-        if not tbody:
-            print("Could not find table body")
-            return None
-
-        rows_data = []
-        for row in tbody.find_all('tr'):
-            row_data = []
-            cells = row.find_all(['td', 'th'])
-
-            for cell in cells:
-                # Handle player name cell which might have additional elements
-                if 'player-name' in cell.get('class', []) or 'player' in str(cell.get('class', [])).lower():
-                    # Extract just the player name, removing team info
-                    player_link = cell.find('a')
-                    if player_link:
-                        player_name = player_link.get_text(strip=True)
-                    else:
-                        player_name = cell.get_text(strip=True)
-                    row_data.append(player_name)
-                else:
-                    # For other cells, just get the text
-                    cell_text = cell.get_text(strip=True)
-                    row_data.append(cell_text)
-
-            if row_data:  # Only add non-empty rows
-                rows_data.append(row_data)
-
-        # Create DataFrame
-        if rows_data:
-            # Ensure all rows have the same number of columns as headers
-            max_cols = len(headers)
-            for i, row in enumerate(rows_data):
-                if len(row) < max_cols:
-                    rows_data[i].extend([''] * (max_cols - len(row)))
-                elif len(row) > max_cols:
-                    rows_data[i] = row[:max_cols]
-
-            df = pd.DataFrame(rows_data, columns=headers)
-            print(f"Successfully scraped {len(df)} fantasy football projections")
-            return df
-        else:
-            print("No data rows found in the table")
-            return None
-
-    except requests.RequestException as e:
-        print(f"Error fetching the webpage: {e}")
-        return None
-    except Exception as e:
-        print(f"Error parsing the data: {e}")
-        return None
-
-
-def scrape_fantasy_projections2(url):
-    """
-    Scrapes fantasy football projections from FantasyPros website
-
-    Args:
-        url (str): The URL of the FantasyPros projections page
-
-    Returns:
-        pandas DataFrame with the projection data
-    """
-
-    # Headers to mimic a real browser request
-    headers = {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
-    }
-
-    try:
-        # Make the request
-        print("Fetching data from FantasyPros...")
-        response = requests.get(url, headers=headers)
-        response.raise_for_status()
-
-        # Parse the HTML
-        soup = BeautifulSoup(response.content, 'html.parser')
-
-        # Find the projections table
-        table = soup.find('table', {'id': 'data'})
-
-        if not table:
-            print("Could not find the projections table. The page structure may have changed.")
-            return None
-
         # Extract table headers - look for the actual column header row
         # Skip the first header row which contains category groupings like "RECEIVING", "RUSHING", "MISC"
         thead = table.find('thead')
@@ -314,13 +163,103 @@ def scrape_fantasy_projections2(url):
         print(f"Error parsing the data: {e}")
         return None
 
+
+def convert_player_names(df, name_column='Name'):
+    """
+    Convert player names in a DataFrame according to specific rules
+
+    Args:
+        df (DataFrame): The DataFrame containing player data
+        name_column (str): The name of the column containing player names
+
+    Returns:
+        DataFrame: DataFrame with converted names
+    """
+
+    # Create a copy to avoid modifying the original DataFrame
+    df_converted = df.copy()
+
+    # Define specific name mappings
+    name_mappings = {
+        "DeVonta Smith": "Devonta Smith",
+        "Tetairoa McMillan": "Tet McMillan",
+        "Deebo Samuel Sr.": "Deebo Samuel",
+        "Michael Pittman Jr.": "Michael Pittman",
+        "Tre' Harris": "Tre Harris",
+        "Patrick Mahomes II": "Patrick Mahomes",
+        "Cameron Ward": "Cam Ward",
+        "Anthony Richardson Sr.": "Anthony Richardson",
+        "Aaron Jones Sr.": "Aaron Jones",
+        "Brian Robinson Jr.": "Brian Robinson",
+        "Travis Etienne Jr.": "Travis Etienne",
+        "Kyle Pitts Sr.": "Kyle Pitts",
+        "Arizona Cardinals": "ARI DST",
+        "Atlanta Falcons": "ATL DST",
+        "Baltimore Ravens": "BAL DST",
+        "Buffalo Bills": "BUF DST",
+        "Carolina Panthers": "CAR DST",
+        "Chicago Bears": "CHI DST",
+        "Cincinnati Bengals": "CIN DST",
+        "Cleveland Browns": "CLE DST",
+        "Dallas Cowboys": "DAL DST",
+        "Denver Broncos": "DEN DST",
+        "Detroit Lions": "DET DST",
+        "Green Bay Packers": "GB DST",
+        "Houston Texans": "HOU DST",
+        "Indianapolis Colts": "IND DST",
+        "Jacksonville Jaguars": "JAX DST",
+        "Kansas City Chiefs": "KC DST",
+        "Las Vegas Raiders": "LV DST",
+        "Los Angeles Chargers": "LAC DST",
+        "Los Angeles Rams": "LA DST",
+        "Miami Dolphins": "MIA DST",
+        "Minnesota Vikings": "MIN DST",
+        "New England Patriots": "NE DST",
+        "New Orleans Saints": "NO DST",
+        "New York Giants": "NYG DST",
+        "New York Jets": "NYJ DST",
+        "Philadelphia Eagles": "PHI DST",
+        "Pittsburgh Steelers": "PIT DST",
+        "San Francisco 49ers": "SF DST",
+        "Seattle Seahawks": "SEA DST",
+        "Tampa Bay Buccaneers": "TB DST",
+        "Tennessee Titans": "TEN DST",
+        "Washington Commanders": "WAS DST"
+    }
+
+    # Apply specific name mappings
+    df_converted[name_column] = df_converted[name_column].replace(name_mappings)
+    return df_converted
+
 #data sources-----------------------------------------------------------------------------------------------------------
 etr_values = pd.read_csv(r'C:\Users\musel\OneDrive\Desktop\Sports Stuff\Fantasy football\Temp_Rankings_Redraft_Auction 2025.csv')
+etr_values = etr_values[(etr_values['Position'] != 'K')]
 etr_values['dollar diff'] = etr_values['ADP Yahoo'] - etr_values['ETR Half PPR']
 
-wr_values = scrape_fantasy_projections2(r'https://www.fantasypros.com/nfl/projections/wr.php?filters=7493:152&week=draft&scoring=HALF&week=draft')
+wr_values = scrape_fantasy_projections(r'https://www.fantasypros.com/nfl/projections/wr.php?filters=7493:152&week=draft&scoring=HALF&week=draft')
 pd.set_option('display.max_columns', None)
-print(wr_values.head())
-#subset = wr_values[['RECEIVING','TDS']]
-#print(subset.head())
+wr_values = wr_values[['Player','FPTS']]
 
+qb_values = scrape_fantasy_projections(r'https://www.fantasypros.com/nfl/projections/qb.php?filters=7493:152&week=draft')
+qb_values = qb_values[['Player','FPTS']]
+
+
+rb_values = scrape_fantasy_projections(r'https://www.fantasypros.com/nfl/projections/rb.php?filters=7493:152&week=draft&scoring=HALF')
+rb_values = rb_values[['Player','FPTS']]
+
+te_values = scrape_fantasy_projections(r'https://www.fantasypros.com/nfl/projections/te.php?filters=7493:152&week=draft&scoring=HALF&week=draft')
+te_values = te_values[['Player','FPTS']]
+
+dst_values = scrape_fantasy_projections(r'https://www.fantasypros.com/nfl/projections/dst.php?filters=7493:152&week=draft')
+dst_values = dst_values[['Player','FPTS']]
+
+#combine projections across positions-----------------------------------------------------------------------------------
+player_values = pd.concat([qb_values, rb_values, wr_values, te_values, dst_values],axis=0)
+player_values = player_values.rename(columns={'Player': 'Name'})
+player_values = convert_player_names(player_values)
+
+#join the projections to auction values---------------------------------------------------------------------------------
+auction_values = pd.merge(etr_values, player_values, on=['Name'],how='left',indicator=True)
+data_check = auction_values[(auction_values['_merge']=='left_only')]
+data_check.to_csv(r'C:\Users\musel\OneDrive\Desktop\Sports Stuff\Fantasy football\name data checking.csv')
+auction_values['FPTS'] = auction_values['FPTS'].fillna(0)
