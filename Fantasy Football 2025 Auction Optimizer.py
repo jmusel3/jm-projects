@@ -1,4 +1,4 @@
-#packages---------------------------------------------------------------------------------------------------------------
+# packages---------------------------------------------------------------------------------------------------------------
 import pandas as pd
 import numpy as np
 import requests
@@ -6,8 +6,11 @@ from bs4 import BeautifulSoup
 from pulp import *
 import itertools
 from collections import defaultdict
+from sklearn.preprocessing import MinMaxScaler
+from scipy import interpolate
 
-#functions--------------------------------------------------------------------------------------------------------------
+
+# functions--------------------------------------------------------------------------------------------------------------
 def scrape_fantasy_projections(url):
     """
     Scrapes fantasy football projections from FantasyPros website
@@ -235,6 +238,166 @@ def convert_player_names(df, name_column='Name'):
     return df_converted
 
 
+def apply_adp_based_scaling(auction_values_df):
+    """
+    Apply scaling using Yahoo ADP to create FPTS mapping, then use 'for scaling' to adjust values.
+
+    Process:
+    1. Create a relationship between Yahoo ADP and original FPTS for each position
+    2. Use 'for scaling' values to determine adjusted FPTS based on this relationship
+
+    Args:
+        auction_values_df (DataFrame): DataFrame with auction values and FPTS
+
+    Returns:
+        DataFrame: DataFrame with scaled FPTS columns
+    """
+    df_scaled = auction_values_df.copy()
+
+    # Clean and convert data types before processing
+    print("Cleaning data types for ADP-based scaling...")
+
+    # Convert columns to numeric, handling missing values
+    df_scaled['FPTS'] = pd.to_numeric(df_scaled['FPTS'], errors='coerce').fillna(0)
+    df_scaled['ADP Yahoo'] = pd.to_numeric(df_scaled['ADP Yahoo'], errors='coerce')
+    df_scaled['for scaling'] = pd.to_numeric(df_scaled['for scaling'], errors='coerce')
+
+    # Fill missing ADP values with position mean
+    for pos in df_scaled['Pos'].unique():
+        pos_mask = df_scaled['Pos'] == pos
+        pos_adp_mean = df_scaled.loc[pos_mask, 'ADP Yahoo'].mean()
+        if not pd.isna(pos_adp_mean):
+            df_scaled.loc[pos_mask, 'ADP Yahoo'] = df_scaled.loc[pos_mask, 'ADP Yahoo'].fillna(pos_adp_mean)
+        else:
+            df_scaled.loc[pos_mask, 'ADP Yahoo'] = df_scaled.loc[pos_mask, 'ADP Yahoo'].fillna(200)
+
+    # Fill missing 'for scaling' values with position mean
+    for pos in df_scaled['Pos'].unique():
+        pos_mask = df_scaled['Pos'] == pos
+        pos_scaling_mean = df_scaled.loc[pos_mask, 'for scaling'].mean()
+        if not pd.isna(pos_scaling_mean):
+            df_scaled.loc[pos_mask, 'for scaling'] = df_scaled.loc[pos_mask, 'for scaling'].fillna(pos_scaling_mean)
+        else:
+            df_scaled.loc[pos_mask, 'for scaling'] = df_scaled.loc[pos_mask, 'for scaling'].fillna(0)
+
+    # Store original FPTS before scaling
+    df_scaled['FPTS_original'] = df_scaled['FPTS'].copy()
+
+    # Apply ADP-based scaling by position
+    positions = df_scaled['Pos'].unique()
+
+    for position in positions:
+        pos_mask = df_scaled['Pos'] == position
+        pos_data = df_scaled[pos_mask].copy()
+
+        if len(pos_data) > 2:  # Need at least 3 points for meaningful relationship
+            # Remove any remaining NaN values
+            valid_mask = ~(
+                        pd.isna(pos_data['ADP Yahoo']) | pd.isna(pos_data['FPTS']) | pd.isna(pos_data['for scaling']))
+            valid_data = pos_data[valid_mask]
+
+            if len(valid_data) > 2:
+                try:
+                    # Step 1: Create ADP-FPTS relationship
+                    # Sort by ADP (lower ADP = better/higher FPTS expected)
+                    valid_data_sorted = valid_data.sort_values('ADP Yahoo')
+
+                    # Create a polynomial relationship between ADP rank and FPTS
+                    # Convert ADP to ranks (1 = best ADP)
+                    valid_data_sorted['ADP_rank'] = range(1, len(valid_data_sorted) + 1)
+
+                    # Fit a curve (polynomial or exponential decay) to model ADP-FPTS relationship
+                    from scipy import interpolate
+                    import numpy as np
+
+                    # Create interpolation function from ADP to FPTS
+                    adp_values = valid_data_sorted['ADP Yahoo'].values
+                    fpts_values = valid_data_sorted['FPTS'].values
+
+                    # Create interpolation function (linear with extrapolation)
+                    if len(adp_values) >= 2:
+                        # Sort by ADP for proper interpolation
+                        sort_idx = np.argsort(adp_values)
+                        adp_sorted = adp_values[sort_idx]
+                        fpts_sorted = fpts_values[sort_idx]
+
+                        # Create interpolation function that can extrapolate
+                        f_adp_to_fpts = interpolate.interp1d(adp_sorted, fpts_sorted,
+                                                             kind='linear',
+                                                             fill_value='extrapolate')
+                    else:
+                        # Fallback: use mean FPTS
+                        mean_fpts = fpts_values.mean()
+                        f_adp_to_fpts = lambda x: np.full_like(x, mean_fpts)
+
+                    # Step 2: Use 'for scaling' values to determine adjusted FPTS
+                    # Map 'for scaling' values to ADP-equivalent values
+                    scaling_values = pos_data['for scaling'].values
+
+                    # Create mapping from 'for scaling' to ADP space
+                    scaling_min, scaling_max = scaling_values.min(), scaling_values.max()
+                    adp_min, adp_max = adp_values.min(), adp_values.max()
+
+                    if scaling_max > scaling_min:
+                        # Map 'for scaling' values to ADP range
+                        # Higher 'for scaling' should map to higher ADP (later draft pick, higher FPTS)
+                        normalized_scaling = (scaling_values - scaling_min) / (scaling_max - scaling_min)
+                        mapped_adp = adp_min + normalized_scaling * (adp_max - adp_min)
+                    else:
+                        # If no range, use median ADP
+                        mapped_adp = np.full_like(scaling_values, np.median(adp_values))
+
+                    # Step 3: Convert mapped ADP values to FPTS using our relationship
+                    adjusted_fpts = f_adp_to_fpts(mapped_adp)
+
+                    # Ensure no negative FPTS
+                    adjusted_fpts = np.maximum(adjusted_fpts, 0)
+
+                    df_scaled.loc[pos_mask, 'FPTS_scaled'] = adjusted_fpts
+
+                except Exception as e:
+                    print(f"Warning: Could not scale position {position}: {e}")
+                    df_scaled.loc[pos_mask, 'FPTS_scaled'] = df_scaled.loc[pos_mask, 'FPTS']
+            else:
+                # If not enough valid values, keep original FPTS
+                df_scaled.loc[pos_mask, 'FPTS_scaled'] = df_scaled.loc[pos_mask, 'FPTS']
+        else:
+            # If too few players, keep original FPTS
+            df_scaled.loc[pos_mask, 'FPTS_scaled'] = df_scaled.loc[pos_mask, 'FPTS']
+
+    # Ensure FPTS_scaled exists for all rows
+    if 'FPTS_scaled' not in df_scaled.columns:
+        df_scaled['FPTS_scaled'] = df_scaled['FPTS']
+
+    # Fill any remaining NaN values in FPTS_scaled
+    df_scaled['FPTS_scaled'] = df_scaled['FPTS_scaled'].fillna(df_scaled['FPTS'])
+
+    # Create summary columns with proper numeric handling
+    df_scaled['FPTS_change'] = pd.to_numeric(df_scaled['FPTS_scaled'], errors='coerce') - pd.to_numeric(
+        df_scaled['FPTS_original'], errors='coerce')
+    df_scaled['FPTS_change'] = df_scaled['FPTS_change'].fillna(0)
+
+    # Calculate percentage change safely
+    original_nonzero = df_scaled['FPTS_original'] != 0
+    df_scaled['FPTS_change_pct'] = 0.0
+    df_scaled.loc[original_nonzero, 'FPTS_change_pct'] = (
+        (df_scaled.loc[original_nonzero, 'FPTS_change'] / df_scaled.loc[original_nonzero, 'FPTS_original'] * 100)
+    ).round(2)
+
+    print("ADP-based scaling applied: Yahoo ADP-FPTS relationship used with 'for scaling' adjustments")
+    print(f"Scaling summary by position:")
+    scaling_summary = df_scaled.groupby('Pos').agg({
+        'FPTS_original': ['mean', 'min', 'max'],
+        'FPTS_scaled': ['mean', 'min', 'max'],
+        'FPTS_change': ['mean', 'min', 'max'],
+        'ADP Yahoo': ['min', 'max'],
+        'for scaling': ['min', 'max']
+    }).round(2)
+    print(scaling_summary)
+
+    return df_scaled
+
+
 class FantasyFootballOptimizer:
     def __init__(self, auction_values_df):
         """
@@ -242,8 +405,8 @@ class FantasyFootballOptimizer:
 
         Expected columns:
         - 'ETR Half PPR': auction dollar values
-        - 'FPTS': fantasy points
-        - 'Position': player position
+        - 'FPTS_scaled': scaled fantasy points (will use FPTS if not available)
+        - 'Pos': player position
         """
         self.df = auction_values_df.copy()
         self.budget = 200
@@ -254,15 +417,23 @@ class FantasyFootballOptimizer:
 
     def prepare_data(self):
         """Clean and prepare the data for optimization"""
+        # Use scaled FPTS if available, otherwise use original FPTS
+        if 'FPTS_scaled' in self.df.columns:
+            self.fpts_column = 'FPTS_scaled'
+            print("Using scaled FPTS for optimization")
+        else:
+            self.fpts_column = 'FPTS'
+            print("Using original FPTS for optimization")
+
         # Remove any rows with missing values in key columns
-        self.df = self.df.dropna(subset=['ETR Half PPR', 'FPTS', 'Position'])
+        self.df = self.df.dropna(subset=['ETR Half PPR', self.fpts_column, 'Pos'])
 
         # Ensure numeric columns are numeric
         self.df['ETR Half PPR'] = pd.to_numeric(self.df['ETR Half PPR'], errors='coerce')
-        self.df['FPTS'] = pd.to_numeric(self.df['FPTS'], errors='coerce')
+        self.df[self.fpts_column] = pd.to_numeric(self.df[self.fpts_column], errors='coerce')
 
         # Remove any remaining NaN values
-        self.df = self.df.dropna(subset=['ETR Half PPR', 'FPTS'])
+        self.df = self.df.dropna(subset=['ETR Half PPR', self.fpts_column])
 
         # Add player index
         self.df.reset_index(drop=True, inplace=True)
@@ -301,12 +472,12 @@ class FantasyFootballOptimizer:
 
         # Create starter variables for each starting position
         for pos in ['QB', 'RB', 'WR', 'TE', 'DST']:
-            pos_players = available_df[available_df['Position'] == pos]['player_idx'].tolist()
+            pos_players = available_df[available_df['Pos'] == pos]['player_idx'].tolist()
             for player_idx in pos_players:
                 starter_vars[f"{pos}_{player_idx}"] = LpVariable(f"starter_{pos}_{player_idx}", cat='Binary')
 
         # Flex starters (additional RB/WR/TE)
-        flex_players = available_df[available_df['Position'].isin(self.flex_positions)]['player_idx'].tolist()
+        flex_players = available_df[available_df['Pos'].isin(self.flex_positions)]['player_idx'].tolist()
         for player_idx in flex_players:
             starter_vars[f"FLEX_{player_idx}"] = LpVariable(f"starter_FLEX_{player_idx}", cat='Binary')
 
@@ -318,13 +489,13 @@ class FantasyFootballOptimizer:
         bench_weight = 1.0
 
         starter_fpts = lpSum([
-            available_df.loc[available_df['player_idx'] == int(var.name.split('_')[-1]), 'FPTS'].iloc[
+            available_df.loc[available_df['player_idx'] == int(var.name.split('_')[-1]), self.fpts_column].iloc[
                 0] * var * starter_weight
             for var in starter_vars.values()
         ])
 
         total_fpts = lpSum([
-            available_df.loc[available_df['player_idx'] == player_idx, 'FPTS'].iloc[0] * var * bench_weight
+            available_df.loc[available_df['player_idx'] == player_idx, self.fpts_column].iloc[0] * var * bench_weight
             for player_idx, var in player_vars.items()
         ])
 
@@ -338,7 +509,7 @@ class FantasyFootballOptimizer:
 
         # Starter constraints - link starter variables to player variables
         # QB starters (exactly 1)
-        qb_players = available_df[available_df['Position'] == 'QB']['player_idx'].tolist()
+        qb_players = available_df[available_df['Pos'] == 'QB']['player_idx'].tolist()
         qb_starter_vars = [starter_vars[f"QB_{p}"] for p in qb_players if f"QB_{p}" in starter_vars]
         if qb_starter_vars:
             prob += lpSum(qb_starter_vars) == 1
@@ -348,7 +519,7 @@ class FantasyFootballOptimizer:
                     prob += starter_vars[f"QB_{p}"] <= player_vars[p]
 
         # RB starters (exactly 2)
-        rb_players = available_df[available_df['Position'] == 'RB']['player_idx'].tolist()
+        rb_players = available_df[available_df['Pos'] == 'RB']['player_idx'].tolist()
         rb_starter_vars = [starter_vars[f"RB_{p}"] for p in rb_players if f"RB_{p}" in starter_vars]
         if rb_starter_vars:
             prob += lpSum(rb_starter_vars) == 2
@@ -357,7 +528,7 @@ class FantasyFootballOptimizer:
                     prob += starter_vars[f"RB_{p}"] <= player_vars[p]
 
         # WR starters (exactly 3)
-        wr_players = available_df[available_df['Position'] == 'WR']['player_idx'].tolist()
+        wr_players = available_df[available_df['Pos'] == 'WR']['player_idx'].tolist()
         wr_starter_vars = [starter_vars[f"WR_{p}"] for p in wr_players if f"WR_{p}" in starter_vars]
         if wr_starter_vars:
             prob += lpSum(wr_starter_vars) == 3
@@ -366,7 +537,7 @@ class FantasyFootballOptimizer:
                     prob += starter_vars[f"WR_{p}"] <= player_vars[p]
 
         # TE starters (exactly 1)
-        te_players = available_df[available_df['Position'] == 'TE']['player_idx'].tolist()
+        te_players = available_df[available_df['Pos'] == 'TE']['player_idx'].tolist()
         te_starter_vars = [starter_vars[f"TE_{p}"] for p in te_players if f"TE_{p}" in starter_vars]
         if te_starter_vars:
             prob += lpSum(te_starter_vars) == 1
@@ -375,7 +546,7 @@ class FantasyFootballOptimizer:
                     prob += starter_vars[f"TE_{p}"] <= player_vars[p]
 
         # DST starters (exactly 1)
-        dst_players = available_df[available_df['Position'] == 'DST']['player_idx'].tolist()
+        dst_players = available_df[available_df['Pos'] == 'DST']['player_idx'].tolist()
         dst_starter_vars = [starter_vars[f"DST_{p}"] for p in dst_players if f"DST_{p}" in starter_vars]
         if dst_starter_vars:
             prob += lpSum(dst_starter_vars) == 1
@@ -399,12 +570,12 @@ class FantasyFootballOptimizer:
                         prob += starter_vars[f"FLEX_{p}"] + starter_vars[f"TE_{p}"] <= 1
 
         # Position constraints for total roster
-        positions = available_df['Position'].unique()
+        positions = available_df['Pos'].unique()
         requirements = self.get_position_requirements()
 
         for pos in positions:
             if pos in requirements:
-                pos_players = available_df[available_df['Position'] == pos]['player_idx'].tolist()
+                pos_players = available_df[available_df['Pos'] == pos]['player_idx'].tolist()
                 pos_vars = [player_vars[p] for p in pos_players if p in player_vars]
 
                 if pos_vars:
@@ -412,7 +583,7 @@ class FantasyFootballOptimizer:
                     # Maximum constraints
                     if pos in ['QB', 'TE']:
                         # Special logic for QB and TE (max 2 only if top 7 not drafted)
-                        top_7_pos = available_df[available_df['Position'] == pos].nlargest(7, 'FPTS')[
+                        top_7_pos = available_df[available_df['Pos'] == pos].nlargest(7, self.fpts_column)[
                             'player_idx'].tolist()
                         top_7_vars = [player_vars[p] for p in top_7_pos if p in player_vars]
 
@@ -448,9 +619,9 @@ class FantasyFootballOptimizer:
                     player_data = {
                         'player_idx': player_idx,
                         'name': player_info.get('Name', f'Player_{player_idx}'),
-                        'position': player_info['Position'],
+                        'position': player_info['Pos'],
                         'cost': player_info['ETR Half PPR'],
-                        'fpts': player_info['FPTS'],
+                        'fpts': player_info[self.fpts_column],
                         'is_starter': False
                     }
 
@@ -467,56 +638,103 @@ class FantasyFootballOptimizer:
         else:
             return None, None
 
-    def find_backup_players(self, selected_players):
-        """Find backup players for each position with similar dollar values"""
+    def find_backup_players(self, selected_players, num_backups=3):
+        """Find backup players for each position with no repetition across position slots"""
         backups = {}
         selected_indices = {p['player_idx'] for p in selected_players}
+        used_backup_indices = set()  # Track already used backup players
 
-        # Group selected players by position and find their average cost
-        position_costs = defaultdict(list)
+        # Create position-specific backup searches
+        all_positions_to_backup = []
+
+        # Add starting positions
+        starters_by_pos = defaultdict(list)
         for player in selected_players:
-            position_costs[player['position']].append(player['cost'])
+            if player['is_starter']:
+                starter_pos = player.get('starter_position', player['position'])
+                starters_by_pos[starter_pos].append(player)
 
-        # Calculate average cost per position
-        avg_costs = {}
-        for pos, costs in position_costs.items():
-            avg_costs[pos] = sum(costs) / len(costs)
+        # Map starters to specific position slots
+        position_mapping = {
+            'QB': ['QB'],
+            'RB': ['RB1', 'RB2'],
+            'WR': ['WR1', 'WR2', 'WR3'],
+            'TE': ['TE'],
+            'DST': ['DST'],
+            'FLEX': ['FLEX']
+        }
 
-        # Find backups for each position with similar cost
-        for pos in ['QB', 'RB', 'WR', 'TE', 'DST']:
-            if pos in avg_costs:
-                target_cost = avg_costs[pos]
+        for pos_group, pos_slots in position_mapping.items():
+            if pos_group in starters_by_pos:
+                players_in_group = starters_by_pos[pos_group]
+                for i, player in enumerate(players_in_group):
+                    if i < len(pos_slots):
+                        pos_key = pos_slots[i]
+                        all_positions_to_backup.append((pos_key, player['position'], player['cost']))
 
-                # Get available players at this position
-                pos_df = self.df[
-                    (self.df['Position'] == pos) &
-                    (~self.df['player_idx'].isin(selected_indices))
-                    ].copy()
+        # Add bench positions
+        bench_counter = defaultdict(int)
+        for player in selected_players:
+            if not player['is_starter']:
+                pos = player['position']
+                bench_counter[pos] += 1
+                bench_key = f"{pos}_BENCH_{bench_counter[pos]}"
+                all_positions_to_backup.append((bench_key, pos, player['cost']))
 
-                if not pos_df.empty:
-                    # Calculate cost difference from target and sort by smallest difference
-                    pos_df['cost_diff'] = abs(pos_df['ETR Half PPR'] - target_cost)
+        # Sort positions to prioritize starters over bench
+        starter_positions = [pos for pos in all_positions_to_backup if 'BENCH' not in pos[0]]
+        bench_positions = [pos for pos in all_positions_to_backup if 'BENCH' in pos[0]]
+        all_positions_to_backup = starter_positions + bench_positions
 
-                    # First, try to find players within 20% of target cost
-                    cost_tolerance = target_cost * 0.2
-                    similar_cost_df = pos_df[pos_df['cost_diff'] <= cost_tolerance]
+        # Find backups for each position, avoiding duplicates
+        for pos_key, actual_position, target_cost in all_positions_to_backup:
+            # Get available players at this position (excluding selected and already used backups)
+            excluded_indices = selected_indices.union(used_backup_indices)
+            pos_df = self.df[
+                (self.df['Pos'] == actual_position) &
+                (~self.df['player_idx'].isin(excluded_indices))
+                ].copy()
 
-                    if not similar_cost_df.empty:
-                        # Among similar cost players, pick the one with highest FPTS
-                        backup = similar_cost_df.nlargest(1, 'FPTS').iloc[0]
-                    else:
-                        # If no players within 20%, pick closest cost with decent FPTS
-                        # Sort by cost difference, then by FPTS descending
-                        pos_df = pos_df.sort_values(['cost_diff', 'FPTS'], ascending=[True, False])
-                        backup = pos_df.iloc[0]
+            if not pos_df.empty:
+                # Calculate cost difference from target and sort by smallest difference
+                pos_df['cost_diff'] = abs(pos_df['ETR Half PPR'] - target_cost)
 
-                    backups[pos] = {
-                        'name': backup.get('Name', f'Player_{backup["player_idx"]}'),
-                        'position': backup['Position'],
-                        'cost': backup['ETR Half PPR'],
-                        'fpts': backup['FPTS'],
-                        'cost_diff_from_selected': abs(backup['ETR Half PPR'] - target_cost)
-                    }
+                # First, try to find players within 25% of target cost
+                cost_tolerance = target_cost * 0.25
+                similar_cost_df = pos_df[pos_df['cost_diff'] <= cost_tolerance]
+
+                if len(similar_cost_df) >= num_backups:
+                    # Among similar cost players, pick the top ones by FPTS
+                    backup_candidates = similar_cost_df.nlargest(num_backups + 5,
+                                                                 self.fpts_column)  # Get extra to ensure uniqueness
+                else:
+                    # If not enough players within tolerance, expand the search
+                    pos_df_sorted = pos_df.sort_values(['cost_diff', self.fpts_column], ascending=[True, False])
+                    backup_candidates = pos_df_sorted.head(num_backups + 5)  # Get extra to ensure uniqueness
+
+                # Select unique backups up to num_backups
+                backups[pos_key] = []
+                for _, backup in backup_candidates.iterrows():
+                    if len(backups[pos_key]) >= num_backups:
+                        break
+
+                    if backup['player_idx'] not in used_backup_indices:
+                        backup_info = {
+                            'name': backup.get('Name', f'Player_{backup["player_idx"]}'),
+                            'position': backup['Pos'],
+                            'cost': backup['ETR Half PPR'],
+                            'fpts': backup[self.fpts_column],
+                            'cost_diff_from_selected': abs(backup['ETR Half PPR'] - target_cost),
+                            'player_idx': backup['player_idx']  # Add for tracking
+                        }
+
+                        # Add scaling info if available
+                        if 'FPTS_original' in backup:
+                            backup_info['fpts_original'] = backup['FPTS_original']
+                            backup_info['fpts_change'] = backup.get('FPTS_change', 0)
+
+                        backups[pos_key].append(backup_info)
+                        used_backup_indices.add(backup['player_idx'])  # Mark as used
 
         return backups
 
@@ -529,8 +747,8 @@ class FantasyFootballOptimizer:
             selected_players, total_fpts = self.create_optimization_problem(all_excluded_players)
 
             if selected_players:
-                # Find backup players
-                backups = self.find_backup_players(selected_players)
+                # Find backup players (3 per position)
+                backups = self.find_backup_players(selected_players, num_backups=3)
 
                 # Calculate totals
                 total_cost = sum(p['cost'] for p in selected_players)
@@ -559,11 +777,11 @@ class FantasyFootballOptimizer:
         return scenarios
 
     def print_scenarios(self, scenarios):
-        """Print formatted scenarios"""
+        """Print formatted scenarios with enhanced backup information"""
         for scenario in scenarios:
-            print(f"\n{'=' * 60}")
+            print(f"\n{'=' * 80}")
             print(f"SCENARIO {scenario['scenario_num']}")
-            print(f"{'=' * 60}")
+            print(f"{'=' * 80}")
             print(f"Total Cost: ${scenario['total_cost']:.1f}")
             print(f"Starting Lineup FPTS: {scenario['starter_fpts']:.1f}")
             print(f"Bench FPTS: {scenario['bench_fpts']:.1f}")
@@ -575,7 +793,7 @@ class FantasyFootballOptimizer:
             bench = [p for p in scenario['players'] if not p['is_starter']]
 
             print(f"\nSTARTING LINEUP:")
-            print("-" * 40)
+            print("-" * 50)
 
             # Group starters by their starting position
             starter_positions = ['QB', 'RB', 'WR', 'TE', 'FLEX', 'DST']
@@ -601,7 +819,7 @@ class FantasyFootballOptimizer:
 
             if bench:
                 print(f"\nBENCH:")
-                print("-" * 40)
+                print("-" * 50)
                 bench_by_pos = defaultdict(list)
                 for player in bench:
                     bench_by_pos[player['position']].append(player)
@@ -611,47 +829,104 @@ class FantasyFootballOptimizer:
                         for player in bench_by_pos[pos]:
                             print(f"{pos}: {player['name']} - ${player['cost']:.1f} ({player['fpts']:.1f} pts)")
 
-            print(f"\nBACKUP OPTIONS:")
-            print("-" * 40)
-            for pos, backup in scenario['backups'].items():
-                cost_diff = backup.get('cost_diff_from_selected', 0)
-                print(f"{pos}: {backup['name']} - ${backup['cost']:.1f} ({backup['fpts']:.1f} pts) [±${cost_diff:.1f}]")
+            print(f"\nBACKUP OPTIONS (Top 3 per position):")
+            print("=" * 80)
 
-#data sources-----------------------------------------------------------------------------------------------------------
-etr_values = pd.read_csv(r'C:\Users\musel\OneDrive\Desktop\Sports Stuff\Fantasy football\Temp_Rankings_Redraft_Auction 2025.csv')
-etr_values = etr_values[(etr_values['Position'] != 'K')]
+            # Sort backup positions for better display
+            backup_positions = sorted(scenario['backups'].keys())
+
+            for pos_key in backup_positions:
+                backups_list = scenario['backups'][pos_key]
+                print(f"\n{pos_key}:")
+                print("-" * 50)
+
+                for i, backup in enumerate(backups_list, 1):
+                    cost_diff = backup.get('cost_diff_from_selected', 0)
+                    base_info = f"  {i}. {backup['name']} - ${backup['cost']:.1f} ({backup['fpts']:.1f} pts) [±${cost_diff:.1f}]"
+
+                    # Add scaling information if available
+                    if 'fpts_original' in backup:
+                        fpts_change = backup.get('fpts_change', 0)
+                        scaling_info = f" | Original: {backup['fpts_original']:.1f} pts (Δ{fpts_change:+.1f})"
+                        base_info += scaling_info
+
+                    print(base_info)
+
+
+# data sources-----------------------------------------------------------------------------------------------------------
+etr_values = pd.read_csv(
+    r'C:\Users\musel\OneDrive\Desktop\Sports Stuff\Fantasy football\Temp_Rankings_Redraft_Auction 2025.csv')
+etr_values = etr_values[(etr_values['Pos'] != 'K')]
 etr_values['dollar diff'] = etr_values['ADP Yahoo'] - etr_values['ETR Half PPR']
 
-wr_values = scrape_fantasy_projections(r'https://www.fantasypros.com/nfl/projections/wr.php?filters=7493:152&week=draft&scoring=HALF&week=draft')
+wr_values = scrape_fantasy_projections(
+    r'https://www.fantasypros.com/nfl/projections/wr.php?filters=7493:152&week=draft&scoring=HALF&week=draft')
 pd.set_option('display.max_columns', None)
-wr_values = wr_values[['Player','FPTS']]
+wr_values = wr_values[['Player', 'FPTS']]
 
-qb_values = scrape_fantasy_projections(r'https://www.fantasypros.com/nfl/projections/qb.php?filters=7493:152&week=draft')
-qb_values = qb_values[['Player','FPTS']]
+qb_values = scrape_fantasy_projections(
+    r'https://www.fantasypros.com/nfl/projections/qb.php?filters=7493:152&week=draft')
+qb_values = qb_values[['Player', 'FPTS']]
 
+rb_values = scrape_fantasy_projections(
+    r'https://www.fantasypros.com/nfl/projections/rb.php?filters=7493:152&week=draft&scoring=HALF')
+rb_values = rb_values[['Player', 'FPTS']]
 
-rb_values = scrape_fantasy_projections(r'https://www.fantasypros.com/nfl/projections/rb.php?filters=7493:152&week=draft&scoring=HALF')
-rb_values = rb_values[['Player','FPTS']]
+te_values = scrape_fantasy_projections(
+    r'https://www.fantasypros.com/nfl/projections/te.php?filters=7493:152&week=draft&scoring=HALF&week=draft')
+te_values = te_values[['Player', 'FPTS']]
 
-te_values = scrape_fantasy_projections(r'https://www.fantasypros.com/nfl/projections/te.php?filters=7493:152&week=draft&scoring=HALF&week=draft')
-te_values = te_values[['Player','FPTS']]
+dst_values = scrape_fantasy_projections(
+    r'https://www.fantasypros.com/nfl/projections/dst.php?filters=7493:152&week=draft')
+dst_values = dst_values[['Player', 'FPTS']]
 
-dst_values = scrape_fantasy_projections(r'https://www.fantasypros.com/nfl/projections/dst.php?filters=7493:152&week=draft')
-dst_values = dst_values[['Player','FPTS']]
-
-#combine projections across positions-----------------------------------------------------------------------------------
-player_values = pd.concat([qb_values, rb_values, wr_values, te_values, dst_values],axis=0)
+# combine projections across positions-----------------------------------------------------------------------------------
+player_values = pd.concat([qb_values, rb_values, wr_values, te_values, dst_values], axis=0)
 player_values = player_values.rename(columns={'Player': 'Name'})
 player_values = convert_player_names(player_values)
 
-#join the projections to auction values---------------------------------------------------------------------------------
-auction_values = pd.merge(etr_values, player_values, on=['Name'],how='left',indicator=True)
-data_check = auction_values[(auction_values['_merge']=='left_only')]
+# join the projections to auction values---------------------------------------------------------------------------------
+auction_values = pd.merge(etr_values, player_values, on=['Name'], how='left', indicator=True)
+data_check = auction_values[(auction_values['_merge'] == 'left_only')]
 data_check.to_csv(r'C:\Users\musel\OneDrive\Desktop\Sports Stuff\Fantasy football\name data checking.csv')
 auction_values['FPTS'] = auction_values['FPTS'].fillna(0)
-auction_values['ETR Half PPR'] = np.where(auction_values['ETR Half PPR'] < auction_values['ADP Yahoo'], auction_values['ADP Yahoo'],auction_values['ETR Half PPR'])
 
-#run optimizer----------------------------------------------------------------------------------------------------------
+# Apply min-max scaling using 'for scaling' column
+print("\nApplying min-max scaling...")
+auction_values = apply_adp_based_scaling(auction_values)
+
+# Save scaled data for inspection
+auction_values.to_csv(r'C:\Users\musel\OneDrive\Desktop\Sports Stuff\Fantasy football\scaled_auction_values.csv',
+                      index=False)
+print("Scaled data saved to 'scaled_auction_values.csv'")
+
+# run optimizer----------------------------------------------------------------------------------------------------------
 optimizer = FantasyFootballOptimizer(auction_values)
-scenarios = optimizer.generate_scenarios(6)
+scenarios = optimizer.generate_scenarios(3)
 optimizer.print_scenarios(scenarios)
+
+# Print scaling summary
+print(f"\n{'=' * 80}")
+print("SCALING SUMMARY")
+print(f"{'=' * 80}")
+
+# Show scaling impact by position
+scaling_impact = auction_values.groupby('Pos').agg({
+    'FPTS_original': ['count', 'mean', 'std'],
+    'FPTS_scaled': ['mean', 'std'],
+    'FPTS_change': ['mean', 'min', 'max'],
+    'FPTS_change_pct': ['mean', 'min', 'max']
+}).round(2)
+
+print(scaling_impact)
+
+# Show top players most affected by scaling
+print(f"\nTop 10 players most POSITIVELY affected by scaling:")
+top_positive = auction_values.nlargest(10, 'FPTS_change')[
+    ['Name', 'Pos', 'FPTS_original', 'FPTS_scaled', 'FPTS_change', 'FPTS_change_pct']]
+print(top_positive.to_string(index=False))
+
+print(f"\nTop 10 players most NEGATIVELY affected by scaling:")
+top_negative = auction_values.nsmallest(10, 'FPTS_change')[
+    ['Name', 'Pos', 'FPTS_original', 'FPTS_scaled', 'FPTS_change', 'FPTS_change_pct']]
+print(top_negative.to_string(index=False))
